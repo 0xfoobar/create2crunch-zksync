@@ -22,6 +22,27 @@ pub use reward::Reward;
 
 // workset size (tweak this!)
 const WORK_SIZE: u32 = 0x4000000; // max. 0x15400000 to abs. max 0xffffffff
+// zkSync-specific CREATE2 prefix (keccak256("zksyncCreate2"))
+static ZKSYNC_CREATE2_PREFIX: [u8; 32] = [
+    0x20, 0x20, 0xdb, 0xa9, 0x1b, 0x30, 0xcc, 0x00,
+    0x06, 0x18, 0x8a, 0xf7, 0x94, 0xc2, 0xfb, 0x30,
+    0xdd, 0x85, 0x20, 0xdb, 0x7e, 0x2c, 0x08, 0x8b,
+    0x7f, 0xc7, 0xc1, 0x03, 0xc0, 0x0c, 0xa4, 0x94,
+];
+
+static FACTORY_ADDRESS: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+];
+
+static ZERO_ADDRESS: [u8; 20] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00
+];
+
 
 const WORK_FACTOR: u128 = (WORK_SIZE as u128) / 1_000_000;
 const CONTROL_CHARACTER: u8 = 0xff;
@@ -42,6 +63,7 @@ pub struct Config {
     pub factory_address: [u8; 20],
     pub calling_address: [u8; 20],
     pub init_code_hash: [u8; 32],
+    pub constructor_input_hash: [u8; 32],
     pub gpu_device: u8,
     pub leading_zeroes_threshold: u8,
     pub total_zeroes_threshold: u8,
@@ -61,6 +83,9 @@ impl Config {
         };
         let Some(init_code_hash_string) = args.next() else {
             return Err("didn't get an init_code_hash argument");
+        };
+        let Some(constructor_input_hash_string) = args.next() else {
+            return Err("didn't get a constructor_input_hash argument");
         };
 
         let gpu_device_string = match args.next() {
@@ -86,6 +111,9 @@ impl Config {
         let Ok(init_code_hash_vec) = hex::decode(init_code_hash_string) else {
             return Err("could not decode initialization code hash argument");
         };
+        let Ok(constructor_input_hash_vec) = hex::decode(constructor_input_hash_string) else {
+            return Err("could not decode constructor input hash argument");
+        };
 
         // convert from vector to fixed array
         let Ok(factory_address) = factory_address_vec.try_into() else {
@@ -96,6 +124,9 @@ impl Config {
         };
         let Ok(init_code_hash) = init_code_hash_vec.try_into() else {
             return Err("invalid length for initialization code hash argument");
+        };
+        let Ok(constructor_input_hash) = constructor_input_hash_vec.try_into() else {
+            return Err("invalid length for constructor input hash argument");
         };
 
         // convert gpu arguments to u8 values
@@ -120,6 +151,7 @@ impl Config {
             factory_address,
             calling_address,
             init_code_hash,
+            constructor_input_hash,
             gpu_device,
             leading_zeroes_threshold,
             total_zeroes_threshold,
@@ -150,12 +182,22 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
 
     // begin searching for addresses
     loop {
-        // header: 0xff ++ factory ++ caller ++ salt_random_segment (47 bytes)
-        let mut header = [0; 47];
-        header[0] = CONTROL_CHARACTER;
-        header[1..21].copy_from_slice(&config.factory_address);
-        header[21..41].copy_from_slice(&config.calling_address);
-        header[41..].copy_from_slice(&FixedBytes::<6>::random()[..]);
+        // // header: 0xff ++ factory ++ caller ++ salt_random_segment (47 bytes)
+        // let mut header = [0; 47];
+        // header[0] = CONTROL_CHARACTER;
+        // header[1..21].copy_from_slice(&config.factory_address);
+        // header[21..41].copy_from_slice(&config.calling_address);
+        // header[41..].copy_from_slice(&FixedBytes::<6>::random()[..]);
+        // Build a 90-byte "header" that has:
+        //   [0..32]: zksyncCreate2 prefix
+        //   [32..64] left padded factory address 0x10000
+        //   [64..84]: zero address 0x0
+        //   [84..90]: random 6 bytes (first part of salt)
+        let mut header = [0u8; 90];
+        header[0..32].copy_from_slice(&ZKSYNC_CREATE2_PREFIX);
+        header[32..64].copy_from_slice(&FACTORY_ADDRESS);
+        header[64..84].copy_from_slice(&ZERO_ADDRESS);
+        header[84..].copy_from_slice(&FixedBytes::<6>::random()[..]);
 
         // create new hash object
         let mut hash_header = Keccak::v256();
@@ -173,9 +215,10 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
                 // clone the partially-hashed object
                 let mut hash = hash_header.clone();
 
-                // update with body and footer (total: 38 bytes)
+                // update with body and footer (total: 70 bytes)
                 hash.update(salt_incremented_segment);
                 hash.update(&config.init_code_hash);
+                hash.update(&config.constructor_input_hash);
 
                 // hash the payload and get the result
                 let mut res: [u8; 32] = [0; 32];
@@ -213,7 +256,23 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
                 // get the full salt used to create the address
                 let header_hex_string = hex::encode(header);
                 let body_hex_string = hex::encode(salt_incremented_segment);
-                let full_salt = format!("0x{}{}", &header_hex_string[42..], &body_hex_string);
+                // let full_salt = format!("0x{}{}", &header_hex_string[42..], &body_hex_string);
+                // header is 58 bytes => 58 * 2 = 116 hex chars
+                // we skip the first 52 bytes => 52 * 2 = 104
+                // so if you only want to display the random 6, you can slice at [104..]
+                let full_salt = format!(
+                    "0x{}{}",
+                    &header_hex_string[128..], // the last 12 hex chars
+                    body_hex_string            // the incremented 6 bytes
+                );
+                // println!("cpu");
+                let full_preimage = format!(
+                    "0x{}{}{}{}",
+                    &header_hex_string,
+                    body_hex_string,
+                    hex::encode(&config.init_code_hash),
+                    hex::encode(&config.constructor_input_hash)
+                );
 
                 // display the salt and the address.
                 let output = format!(
@@ -221,6 +280,7 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
                     reward_amount.unwrap_or("0")
                 );
                 println!("{output}");
+                println!("{full_preimage}");
 
                 // create a lock on the file before writing
                 file.lock_exclusive().expect("Couldn't lock file.");
@@ -486,13 +546,22 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
 
             let solution = solution.to_le_bytes();
 
-            let mut solution_message = [0; 85];
-            solution_message[0] = CONTROL_CHARACTER;
-            solution_message[1..21].copy_from_slice(&config.factory_address);
-            solution_message[21..41].copy_from_slice(&config.calling_address);
-            solution_message[41..45].copy_from_slice(&salt[..]);
-            solution_message[45..53].copy_from_slice(&solution);
-            solution_message[53..].copy_from_slice(&config.init_code_hash);
+            // let mut solution_message = [0; 85];
+            // solution_message[0] = CONTROL_CHARACTER;
+            // solution_message[1..21].copy_from_slice(&config.factory_address);
+            // solution_message[21..41].copy_from_slice(&config.calling_address);
+            // solution_message[41..45].copy_from_slice(&salt[..]);
+            // solution_message[45..53].copy_from_slice(&solution);
+            // solution_message[53..].copy_from_slice(&config.init_code_hash);
+
+            let mut solution_message = [0; 160];
+            solution_message[0..32].copy_from_slice(&ZKSYNC_CREATE2_PREFIX);
+            solution_message[32..64].copy_from_slice(&FACTORY_ADDRESS);
+            solution_message[64..84].copy_from_slice(&ZERO_ADDRESS);
+            solution_message[84..88].copy_from_slice(&salt[..]);
+            solution_message[88..96].copy_from_slice(&solution);
+            solution_message[96..128].copy_from_slice(&config.init_code_hash);
+            solution_message[128..160].copy_from_slice(&config.constructor_input_hash);
 
             // create new hash object
             let mut hash = Keccak::v256();
